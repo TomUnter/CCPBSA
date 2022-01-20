@@ -1,0 +1,7 @@
+epsIn=2
+epsOut=78
+filling=60
+spacing=0.5
+rmsc=0.01
+maxc=0.01
+nomem

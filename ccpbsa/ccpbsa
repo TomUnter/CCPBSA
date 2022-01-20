@@ -1,0 +1,1109 @@
+#!/opt/anaconda3/bin/python3.7
+
+#/bin/env python3
+
+import argparse
+from multiprocessing import Pool
+from ccpbsa import *
+import os
+
+cliparser = argparse.ArgumentParser()
+pkgpath = "/".join(__file__.split("/")[:-3] + ['ccpbsa'])
+print(pkgpath)
+
+cliparser.add_argument(
+    "routine",
+    help="The first argument chooses which routine to run",
+    choices={'stability', 'affinity', 'gxg', 'wtaffinity'}
+)
+
+options = cliparser.add_argument_group("OPTIONS")
+
+options.add_argument(
+    "-w", "--wildtype",
+    help=".pdb file of the wildtype protein."
+)
+options.add_argument(
+    "-m", "--mutations",
+    help="a .txt file with the list of mutations. Each mutant separated \
+    by a newline. Multiple mutations in the same mutant are to be \
+    separated by comma."
+)
+options.add_argument(
+    "-f", "--flags",
+    help="The flags, which should be passed to CONCOORD and GROMACS. At \
+    least the number of structures in CONCOORD and the forcefield and water \
+    model should be specified in there",
+    default=pkgpath+'/parameters/flags.txt'
+)
+options.add_argument(
+    "-c", "--chains",
+    help="Name of chains in the .pdb file for the first protein group. \
+    Only needed in affinity calculation.",
+    default='A',
+    nargs='+'
+)
+options.add_argument(
+    "--fit-parameters",
+    help="scaling factors of the ddG calculations. Names should fit the \
+    kind of calculation. Default parameters depend on what is calculated",
+    default=pkgpath,
+)
+options.add_argument(
+    "--energy-mdp",
+    default=pkgpath+'/parameters/energy.mdp',
+    help=".mdp file for GROMACS Lennard-Jones Energy evaluations."
+)
+options.add_argument(
+    "--gxg-table",
+    default=pkgpath+'/parameters/GXG.csv',
+    help="GXG table used for stability change calculations."
+)
+options.add_argument(
+    "-v",
+    help="Print stdout and stderr of the programs.",
+    action='store_true'
+)
+options.add_argument(
+    "--no-concoord",
+    help="Run energy extraction from minimized structures only, without \
+    generating structure ensembles with CONCOORD.",
+    action='store_true'
+)
+options.add_argument(
+    '--cores',
+    default=0,
+    help="Specify the number of cores to use for multiprocessing, takes \
+    the maximum amount available per default.",
+    type=int
+)
+options.add_argument(
+    '--ckpt',
+    help="Specify the directory you wish to resume"
+)
+options.add_argument(
+        '--gropbs',
+        help="Specify number of cores used for gropbs",
+        type=int
+)
+options.add_argument(
+        '--wt-G',
+        help="File, which contains G values for the wildtype"
+)
+cliargs = cliparser.parse_args()
+gxg_table = os.path.abspath(cliargs.gxg_table)
+cliargs.flags = os.path.abspath(cliargs.flags)
+cliargs.fit_parameters = os.path.abspath(cliargs.fit_parameters)
+cliargs.energy_mdp = os.path.abspath(cliargs.energy_mdp)
+#wt_value = os.path.abspath(cliargs.wt_G)
+
+if __name__ == '__main__':
+
+    if cliargs.wt_G:
+        wt_value = True
+    else:
+        wt_value = False
+
+    if cliargs.v:
+        verbose = 1
+    else:
+        verbose = 0
+
+    if cliargs.cores == 0:
+        cliargs.cores = os.cpu_count()
+
+    if cliargs.gropbs == 0:
+        cliargs.gropbs = os.cpucount()
+
+    if not cliargs.ckpt:
+
+        if cliargs.routine == 'gxg':
+            gxg = GXG(
+                flags=cliargs.flags,
+                spmdp=cliargs.energy_mdp,
+                verbosity=verbose
+            )
+
+            def multienergy(d):
+                os.chdir(d)
+                gxg.do_minimization(d)
+                gxg.single_point()
+                gxg.electrostatics()
+                gxg.lj()
+                gxg.area()
+                os.chdir(gxg.maindir)
+
+            if cliargs.no_concoord:
+                pool = Pool(cliargs.cores)
+                pool.map(multimini, gxg.wds)
+                pool.close()
+                pool.join()
+
+            else:
+
+                def multimini(d):
+                    os.chdir(d)
+                    gxg.do_minimization(d)
+                    os.chdir(gxg.maindir)
+
+                def multicoord(d):
+                    os.chdir(d)
+                    gxg.do_concoord(d)
+                    os.chdir(gxg.maindir)
+
+                def multropy(en):
+                    os.chdir(en)
+                    gxg.schlitter(en)
+                    os.chdir(gxg.maindir)
+
+                pool = Pool(cliargs.cores)
+                pool.map(multimini, gxg.wds)
+                pool.close()
+                pool.join()
+
+                gxg.update_structs()
+
+                pool = Pool(cliargs.cores)
+                pool.map(multicoord, gxg.wds)
+                pool.close()
+                pool.join()
+
+                ensembles = gxg.wds.copy()
+                gxg.wds = [d+'/'+str(i) for d in gxg.wds \
+                        for i in range(1, len(gxg)+1)]
+
+                pool = Pool(cliargs.cores)
+                pool.map(multienergy, gxg.wds)
+                pool.close()
+                pool.join()
+
+                pool = Pool(cliargs.cores)
+                pool.map(multropy, ensembles)
+                pool.close()
+                pool.join()
+
+                gxg.search_data()
+                print(gxg.G_mean)
+                gxg.G.to_csv('GXG_all.csv')
+                gxg.G_mean.to_csv('GXG.csv')
+
+        if cliargs.routine == 'stability':
+            print(cliargs.routine)
+
+            if cliargs.fit_parameters == pkgpath:
+                fitprm = 'parameters/fit_stability.txt'
+                #fitprm = pkgpath + '/parameters/fit_stability.txt'
+                cliargs.fit_parameters = fitprm
+            with open(cliargs.fit_parameters, 'r') as fit:
+                parameters = fit.readlines()
+                parameters = [l[:-1] for l in parameters] # Remove newlines		
+                parameters = [l.split("=") for l in parameters]
+                parameters = dict([(l[0], float(l[1])) for l in parameters])
+                
+            print("Initializing directory.")
+
+            data = DataGenerator(
+                wtpdb = cliargs.wildtype,
+                mutlist = cliargs.mutations,
+                flags = cliargs.flags,
+                spmdp = cliargs.energy_mdp,
+    #            verbosity = verbose
+                verbosity = 1
+            )   
+
+            def multienergy(d):
+                os.chdir(d)
+                data.do_minimization(d)
+                data.single_point()
+                data.electrostatics()
+                data.lj()
+                data.area()
+                data.mefinish()
+                os.chdir(data.maindir)
+
+
+            if cliargs.no_concoord:
+                pool = Pool(cliargs.cores)
+                pool.map(multienergy, data.wds)
+                pool.close()
+                pool.join()
+                data.n = 0
+
+                search = DataCollector(data)
+                search.search_lj()
+                search.search_electro()
+                search.search_area()
+
+                for c in search.G.columns:
+                    
+                    for i in search.G_mean.index:
+                        search.G_mean.loc[i, c] = search.G.loc[i, c].mean()
+
+            else:
+
+                def multimini(d):
+                    os.chdir(d)
+
+                    try:
+                        data.do_minimization(d)
+
+                    except KeyError:
+                        raise Exception("Missing flags for GROMACS, check flags file")
+
+                    os.chdir(data.maindir)
+
+                def multicoord(d):
+                    os.chdir(d)
+
+                    try:
+                        data.do_concoord(d)
+                        
+                    except FileNotFoundError:
+                        raise Exception("Your CONCOORD run failed!") 
+
+                    os.chdir(data.maindir)
+
+                def multropy(en):
+                    os.chdir(en)
+                    data.schlitter(en)
+                    os.chdir(data.maindir)
+
+                pool = Pool(cliargs.cores)
+                pool.map(multimini, data.wds)
+                pool.close()
+                pool.join()
+
+                data.update_structs()
+
+                pool = Pool(cliargs.cores)
+                pool.map(multicoord, data.wds)
+                pool.close()
+                pool.join()
+
+                with open('checkpoint.txt', 'w') as f:
+                    f.write('you can now use the --ckpt argument to resume')
+
+
+                ensembles = data.wds.copy()
+                data.wds = [d+'/'+str(i) for d in data.wds \
+                        for i in range(1, len(data)+1)]
+
+                pool = Pool(cliargs.cores)
+                pool.map(multienergy, data.wds)
+                pool.close()
+                pool.join()
+
+                pool = Pool(cliargs.cores)
+                pool.map(multropy, ensembles)
+                pool.close()
+                pool.join()
+
+            search = DataCollector(data)
+            search.search_data()
+
+            print("G folded mean values:")
+            print(search.G_mean)
+            search.G.to_csv("G_fold.csv")
+            search.G_mean.to_csv("G_fold_mean.csv")
+
+            search.dstability(gxg_table)
+            print("dG folded values:")
+            print(search.dG)
+            print("dG unfolded values (GXG):")
+
+            if cliargs.no_concoord:
+                search.dG_unfld['-TS'] = 0
+
+            print(search.dG_unfld)
+            search.dG.to_csv("dG_fold.csv")
+            search.dG_unfld.to_csv("dG_unfold.csv")
+
+            search.ddstability()
+            print("ddG values:")
+            print("without fit:")
+            print(search.ddG)
+            search.ddG.to_csv("ddG.csv")
+            ddG_fit = search.fitstability(**parameters)
+            print("with fit:")
+            print(ddG_fit)
+            search.ddG.to_csv("ddG_fit.csv")
+
+        if cliargs.routine == 'affinity':
+
+            if cliargs.fit_parameters == pkgpath:
+                fitprm = pkgpath + '/parameters/fit_affinity.txt'
+                cliargs.fit_parameters = fitprm
+
+            with open(cliargs.fit_parameters, 'r') as fit:
+                parameters = fit.readlines()
+                parameters = [l[:-1] for l in parameters] # Remove newlines
+                parameters = [l.split("=") for l in parameters]
+                parameters = dict([(l[0], float(l[1])) for l in parameters])
+
+            print("Initializing directory.")
+
+            data = AffinityGenerator(
+                wtpdb = cliargs.wildtype,
+                mutlist = cliargs.mutations,
+                flags = cliargs.flags,
+                chaingrp = "".join(cliargs.chains),
+                spmdp = cliargs.energy_mdp,
+                dummy=False,
+                verbosity = verbose
+            )
+
+            def multienergy(d):
+                os.chdir(d)
+                data.do_minimization(d)
+                data.single_point()
+                data.lj()
+                with open('multienergy1_finished.txt', 'w') as f:
+                    f.write("")
+                os.chdir(data.maindir)
+
+            def GroPBS(d):
+                os.chdir(d)
+                print(d)
+                data.electrostatics()
+                os.chdir(data.maindir)
+
+            def multienergy_chains(d):
+                os.chdir(d)
+                data.do_minimization_chains()
+                data.single_point_chains()
+                data.lj_chains()
+                with open('multienergy2_finished.txt', 'w') as f:
+                    f.write("")
+                os.chdir(data.maindir)
+
+            def GroPBS_chains(d):
+                os.chdir(d)
+                data.electrostatics_chains()
+                with open('multienergy3_finished.txt', 'w') as f:
+                    f.write('')
+                os.chdir(data.maindir)
+
+            if wt_value:
+                data.wds.remove(data.wt)
+
+
+
+            if cliargs.no_concoord:
+                pool = Pool(cliargs.cores)
+                pool.map(multienergy, data.wds)
+                pool.close()
+                pool.join()
+
+                for d in data.wds:
+                    os.chdir(d)
+                    data.split_chains(d)
+                    os.chdir(data.maindir)
+
+                pool = Pool(cliargs.cores)
+                pool.map(multienergy_chains, data.wds)
+                pool.close()
+                pool.join()
+
+                data.n = 0
+
+                data.area()
+
+            else:
+
+                def multimini(d):
+                    os.chdir(d)
+
+                    try:
+                        data.do_minimization(d)
+
+                    except KeyError:
+                        raise Exception("Missing flags for GROMACS, check flags file")
+
+                    os.chdir(data.maindir)
+
+                def multicoord(d):
+                    os.chdir(d)
+
+                    try:
+                        data.do_concoord(d)
+                        
+                    except FileNotFoundError:
+                        raise Exception("Your CONCOORD run failed!") 
+
+                    os.chdir(data.maindir)
+
+
+                pool = Pool(cliargs.cores)
+                pool.map(multimini, data.wds)
+                pool.close()
+                pool.join()
+
+                data.update_structs()
+
+                pool = Pool(cliargs.cores)
+                pool.map(multicoord, data.wds)
+                pool.close()
+                pool.join()
+
+                with open('checkpoint1.txt', 'w') as f:
+                    f.write("concoord has finished you can now use the --ckpt argument")
+
+                data.wds = [d+'/'+str(i) for d in data.wds \
+                        for i in range(1, len(data)+1)]
+
+                pool = Pool(cliargs.cores)
+                pool.map(multienergy, data.wds)
+                pool.close()
+                pool.join()
+
+                pool=Pool(cliargs.gropbs)
+                pool.map(GroPBS, data.wds)
+                pool.close()
+                pool.join()
+
+                for d in data.wds:
+                    os.chdir(d)
+                    data.split_chains(d)
+                    os.chdir(data.maindir)
+                with open('checkpoint2.txt', 'w') as f:
+                    f.write('Calculations for complexes are finished and PDBs are split into chains')
+
+
+                pool = Pool(cliargs.cores)
+                pool.map(multienergy_chains, data.wds)
+                pool.close()
+                pool.join()
+
+                pool = Pool(cliargs.gropbs)
+                pool.map(GroPBS_chains, data.wds)
+                pool.close()
+                pool.join()
+
+                if not wt_value:
+                    data.area()
+            
+            if wt_value:
+#                data.wds.extend([data.wt+'/'+str(i) for i in range(1, len(data)+1)])
+                search = AffinityCollector(data)
+                wt_value = os.path.abspath(cliargs.wt_G)
+                
+                wt_list = pd.read_csv(wt_values)
+                wt_values = wt_list.values.tolist()
+                
+                search.search_data(wt_values, wt=True)
+
+                search.daffinity()
+                search.ddaffinity()
+                
+            else:
+                
+                search = AffinityCollector(data)
+                search.search_data()
+
+                search.daffinity()
+                search.ddaffinity()
+
+            print("G values:")
+            print("bound")
+            print(search.G_bound_mean)
+            search.G_bound.to_csv('G_bound.csv')
+            search.G_bound_mean.to_csv("G_bound_mean.csv")
+            print("unbound")
+            print(search.G_grp1_mean)
+            search.G_grp1.to_csv('G_grp1.csv')
+            search.G_grp1_mean.to_csv('G_grp1_mean.csv')
+            print(search.G_grp2_mean)
+            search.G_grp2.to_csv('G_grp2.csv')
+            search.G_grp2_mean.to_csv('G_grp2_mean.csv')
+
+            print("dG values:")
+            print("bound")
+            print(search.dG_bound)
+            search.dG_bound.to_csv('dG_bound.csv')
+            print("unbound")
+            print(search.dG_unbound)
+            search.dG_bound.to_csv('dG_unbound.csv')
+
+            print("ddG values:")
+            print("without fit")
+            print(search.ddG)
+            search.ddG.to_csv('ddG.csv')
+
+            search.fitaffinity(**parameters)
+            print("with fit:")
+            print(search.ddG)
+            search.ddG.to_csv('ddG_fit.csv')
+
+
+        if cliargs.routine == 'wtaffinity':
+
+            if cliargs.fit_parameters == pkgpath:
+                fitprm = pkgpath + '/parameters/fit_affinity.txt'
+                cliargs.fit_parameters = fitprm
+
+            with open(cliargs.fit_parameters, 'r') as fit:
+                parameters = fit.readlines()
+                parameters = [l[:-1] for l in parameters] # Remove newlines
+                parameters = [l.split("=") for l in parameters]
+                parameters = dict([(l[0], float(l[1])) for l in parameters])
+
+            print("Initializing directory.")
+
+            data = AffinityGenerator(
+                wtpdb = cliargs.wildtype,
+                mutlist = None,
+                flags = cliargs.flags,
+                chaingrp = "".join(cliargs.chains),
+                spmdp = cliargs.energy_mdp,
+                verbosity = verbose,
+                dummy = True
+            )
+
+            def multienergy(d):
+                os.chdir(d)
+                data.do_minimization(d)
+                data.single_point()
+                data.lj()
+                with open('multienergy1_finished.txt', 'w') as f:
+                    f.write("")
+                os.chdir(data.maindir)
+
+            def GroPBS(d):
+                os.chdir(d)
+                print(d)
+                data.electrostatics()
+                os.chdir(data.maindir)
+
+            def multienergy_chains(d):
+                os.chdir(d)
+                data.do_minimization_chains()
+                data.single_point_chains()
+                data.lj_chains()
+                with open('multienergy2_finished.txt', 'w') as f:
+                    f.write("")
+                os.chdir(data.maindir)
+
+            def GroPBS_chains(d):
+                os.chdir(d)
+                data.electrostatics_chains()
+                with open('multienergy3_finished.txt', 'w') as f:
+                    f.write('')
+                os.chdir(data.maindir)
+
+
+
+            if cliargs.no_concoord:
+                pool = Pool(cliargs.cores)
+                pool.map(multienergy, data.wds)
+                pool.close()
+                pool.join()
+
+                for d in data.wds:
+                    os.chdir(d)
+                    data.split_chains(d)
+                    os.chdir(data.maindir)
+
+                pool = Pool(cliargs.cores)
+                pool.map(multienergy_chains, data.wds)
+                pool.close()
+                pool.join()
+
+                data.n = 0
+
+                data.area()
+
+            else:
+
+                def multimini(d):
+                    os.chdir(d)
+
+                    try:
+                        data.do_minimization(d)
+
+                    except KeyError:
+                        raise Exception("Missing flags for GROMACS, check flags file")
+
+                    os.chdir(data.maindir)
+
+                def multicoord(d):
+                    os.chdir(data.maindir)
+                    os.chdir(d)
+
+                    try:
+                        data.do_concoord(d)
+                        
+                    except FileNotFoundError:
+                        raise Exception("Your CONCOORD run failed!") 
+
+                    os.chdir(data.maindir)
+
+
+                pool = Pool(cliargs.cores)
+                pool.map(multimini, data.wds)
+                pool.close()
+                pool.join()
+
+                data.update_structs()
+
+                pool = Pool(cliargs.cores)
+                pool.map(multicoord, data.wds)
+                pool.close()
+                pool.join()
+
+                with open('checkpoint1.txt', 'w') as f:
+                    f.write("concoord has finished you can now use the --ckpt argument")
+
+                data.wds = [d+'/'+str(i) for d in data.wds \
+                        for i in range(1, len(data)+1)]
+
+                pool = Pool(cliargs.cores)
+                pool.map(multienergy, data.wds)
+                pool.close()
+                pool.join()
+
+                pool=Pool(cliargs.gropbs)
+                pool.map(GroPBS, data.wds)
+                pool.close()
+                pool.join()
+
+                for d in data.wds:
+                    os.chdir(d)
+                    data.split_chains(d)
+                    os.chdir(data.maindir)
+                with open('checkpoint2.txt', 'w') as f:
+                    f.write('Calculations for complexes are finished and PDBs are split into chains')
+
+
+                pool = Pool(cliargs.cores)
+                pool.map(multienergy_chains, data.wds)
+                pool.close()
+                pool.join()
+
+                pool = Pool(cliargs.gropbs)
+                pool.map(GroPBS_chains, data.wds)
+                pool.close()
+                pool.join()
+
+                data.area()
+            
+            search = WTCollector(data)
+            search.search_data()
+
+            print("G values:")
+            print("bound")
+            print(search.G_bound_mean)
+            search.G_bound.to_csv('G_bound.csv')
+            search.G_bound_mean.to_csv("G_bound_mean.csv")
+            print("unbound")
+            print(search.G_grp1_mean)
+            search.G_grp1.to_csv('G_grp1.csv')
+            search.G_grp1_mean.to_csv('G_grp1_mean.csv')
+            print(search.G_grp2_mean)
+            search.G_grp2.to_csv('G_grp2.csv')
+            search.G_grp2_mean.to_csv('G_grp2_mean.csv')
+            search.merge()
+
+
+#__________________________ Checkpoints______________________________________
+
+    else:
+
+        cliargs.ckpt = os.path.abspath(cliargs.ckpt)
+        if cliargs.routine == 'stability':
+            print(cliargs.routine)
+
+            if cliargs.fit_parameters == pkgpath:
+                fitprm = 'parameters/fit_stability.txt'
+                #fitprm = pkgpath + '/parameters/fit_stability.txt'
+                cliargs.fit_parameters = fitprm
+            with open(cliargs.fit_parameters, 'r') as fit:
+                parameters = fit.readlines()
+                parameters = [l[:-1] for l in parameters] # Remove newlines
+                parameters = [l.split("=") for l in parameters]
+                parameters = dict([(l[0], float(l[1])) for l in parameters])
+
+            data  = ResumeCheckpoint_stability(
+                wtpdb = cliargs.wildtype,
+                mutlist = cliargs.mutations,
+                ckpt = cliargs.ckpt,
+                flags = cliargs.flags,
+                spmdp = cliargs.energy_mdp,
+                verbosity = 1    
+            )
+
+            def multienergy(d):
+                os.chdir(data.maindir)
+                os.chdir(d)
+                if os.path.isfile('multienergy_finished.txt'):
+                    print(d, 'was already finished')
+                    os.chdir(data.maindir)
+                else:
+                    data.do_minimization(d)
+                    data.single_point()
+                    data.electrostatics()
+                    data.lj()
+                    data.area()
+                    with open("multienergy_finished.txt", "w+") as f:
+                        f.write("")
+                    os.chdir(data.maindir)
+
+
+            def multropy(en):
+                os.chdir(data.maindir)
+                os.chdir(en)
+                data.schlitter(en)
+                os.chdir(data.maindir)
+
+            ensembles = data.wds.copy()
+            data.wds = [d+'/'+str(i) for d in data.wds \
+                    for i in range(1, len(data)+1)]
+
+            pool = Pool(cliargs.cores)
+            pool.map(multienergy, data.wds)
+            pool.close()
+            pool.join()
+
+            pool = Pool(cliargs.cores)
+            pool.map(multropy, ensembles)
+            pool.close()
+            pool.join()
+
+            search = DataCollector(data)
+            search.search_data()
+
+            print("G folded mean values:")
+            print(search.G_mean)
+            search.G.to_csv("G_fold.csv")
+            search.G_mean.to_csv("G_fold_mean.csv")
+
+            search.dstability(gxg_table)
+            print("dG folded values:")
+            print(search.dG)
+            print("dG unfolded values (GXG)")
+
+            print(search.dG_unfld)
+            search.dG.to_csv("dG_fold.csv")
+            search.dG_unfld.to_csv("dG_unfold.csv")
+
+            search.ddstability()
+            print("ddG vales:")
+            print("without fit:")
+            print(search.ddG)
+            search.ddG.to_csv("ddG.csv")
+            ddG_fit = search.fitstability(**parameters)
+            print("with fit:")
+            print(ddG_fit)
+            search.ddG.to_csv("ddG_fit.csv")
+
+
+
+
+        if cliargs.routine == 'affinity':
+
+            if cliargs.fit_parameters == pkgpath:
+                fitprm = pkgpath + '/parameters/fit_affinity.txt'
+                cliargs.fit_parameters = fitprm
+
+            with open(cliargs.fit_parameters, 'r') as fit:
+                parameters = fit.readlines()
+                parameters = [l[:-1] for l in parameters] # Remove newlines
+                parameters = [l.split("=") for l in parameters]
+                parameters = dict([(l[0], float(l[1])) for l in parameters])
+
+            data = ResumeCheckpoint_affinity(
+                wtpdb = cliargs.wildtype,
+                mutlist = cliargs.mutations,
+                flags = cliargs.flags,
+                chaingrp = "".join(cliargs.chains),
+                spmdp = cliargs.energy_mdp,
+                ckpt = cliargs.ckpt,
+                dummy = False,
+                verbosity = verbose
+            )
+
+            def multienergy(d):
+                os.chdir(data.maindir)
+                os.chdir(d)
+                if os.path.isfile('multienergy1_finished.txt'):
+                    print(d, 'multienergy for complex was already finished')
+                    os.chdir(data.maindir)
+                else:
+                    data.do_minimization(d)
+                    data.single_point()
+                    data.lj()
+                    with open('multienergy1_finished.txt', 'w') as f:
+                        f.write("")
+                    os.chdir(data.maindir)
+
+            def GroPBS(d):
+                os.chdir(data.maindir)
+                os.chdir(d)
+                if os.path.isfile('solvation.log'):
+                    print(d, 'GroPBS was already finished')
+                    os.chdir(data.maindir)
+                else:
+                    print(d)
+                    data.electrostatics()
+                    os.chdir(data.maindir)
+
+            def multienergy_chains(d):
+                os.chdir(data.maindir)
+                os.chdir(d)
+                if os.path.isfile('multienergy2_finished.txt'):
+                    print(d, 'multienergy for chains was already finished')
+                    os.chdir(data.maindir)
+                else:
+                    data.do_minimization_chains()
+                    data.single_point_chains()
+                    data.lj_chains()
+                    with open('multienergy2_finished.txt', 'w') as f:
+                        f.write("")
+                    os.chdir(data.maindir)
+
+            def GroPBS_chains(d):
+                os.chdir(data.maindir)
+                os.chdir(d)
+                if os.path.isfile('multienergy3_finished.txt'):
+                    print(d, 'electrostatics for the chains was already finished')
+                    os.chdir(data.maindir)
+                else:
+                    print('chains_electro: ', d)
+                    data.electrostatics_chains()
+                    with open('multienergy3_finished.txt', 'w')as f:
+                        f.write("")
+                    os.chdir(data.maindir)
+
+            if wt_value:
+                data.wds.remove(data.wt)
+                print('removed wt from wds')
+
+            data.wds = [d+'/'+str(i) for d in data.wds \
+                    for i in range(1, len(data)+1)]
+
+            print(data.wds)
+
+            pool = Pool(cliargs.cores)
+            pool.map(multienergy, data.wds)
+            pool.close()
+            pool.join()
+
+
+            pool = Pool(cliargs.gropbs)
+            pool.map(GroPBS, data.wds)
+            pool.close()
+            pool.join()
+
+            os.chdir(data.maindir)
+            if not os.path.isfile('checkpoint2.txt'):
+                print("Splitting PDBs into chains, may take a few minutes")
+
+                for d in data.wds:
+                    os.chdir(data.maindir)
+                    os.chdir(d)
+                    data.split_chains(d)
+                    os.chdir(data.maindir)
+                with open('checkpoint2.txt', 'w') as f:
+                    f.write("Calculations for the complex are finished and are splitted into chains")
+            else:
+                pass
+
+            pool = Pool(cliargs.cores)
+            pool.map(multienergy_chains, data.wds)
+            pool.close()
+            pool.join()
+
+            pool = Pool(cliargs.gropbs)
+            pool.map(GroPBS_chains, data.wds)
+            pool.close()
+            pool.join()
+
+
+
+            if not wt_value:
+                    data.area()
+            
+            if wt_value:
+#                data.wds.extend([data.wt+'/'+str(i) for i in range(1, len(data)+1)])
+                search = AffinityCollector(data)
+                wt_value = os.path.abspath(cliargs.wt_G)
+                wt_list = pd.read_csv(wt_value)
+                wt_values = wt_list.values.tolist()
+                
+                search.search_data(wt_values, wt=True)
+
+                search.daffinity()
+                search.ddaffinity()
+                
+            else:
+                
+                search = AffinityCollector(data)
+                search.search_data()
+
+                search.daffinity()
+                search.ddaffinity()
+
+            print("G values:")
+            print("bound")
+            print(search.G_bound_mean)
+            search.G_bound.to_csv('G_bound.csv')
+            search.G_bound_mean.to_csv("G_bound_mean.csv")
+            print("unbound")
+            print(search.G_grp1_mean)
+            search.G_grp1.to_csv('G_grp1.csv')
+            search.G_grp1_mean.to_csv('G_grp1_mean.csv')
+            print(search.G_grp2_mean)
+            search.G_grp2.to_csv('G_grp2.csv')
+            search.G_grp2_mean.to_csv('G_grp2_mean.csv')
+
+            print("dG values:")
+            print("bound")
+            print(search.dG_bound)
+            search.dG_bound.to_csv('dG_bound.csv')
+            print("unbound")
+            print(search.dG_unbound)
+            search.dG_bound.to_csv('dG_unbound.csv')
+
+            print("ddG values:")
+            print("without fit")
+            print(search.ddG)
+            search.ddG.to_csv('ddG.csv')
+
+            search.fitaffinity(**parameters)
+            print("with fit:")
+            print(search.ddG)
+            search.ddG.to_csv('ddG_fit.csv')
+
+
+        if cliargs.routine == 'wtaffinity':
+            print('Currently in wtaffinity ckpt')
+
+            if cliargs.fit_parameters == pkgpath:
+                fitprm = pkgpath + '/parameters/fit_affinity.txt'
+                cliargs.fit_parameters = fitprm
+
+            with open(cliargs.fit_parameters, 'r') as fit:
+                parameters = fit.readlines()
+                parameters = [l[:-1] for l in parameters] # Remove newlines
+                parameters = [l.split("=") for l in parameters]
+                parameters = dict([(l[0], float(l[1])) for l in parameters])
+
+            data = ResumeCheckpoint_affinity(
+                wtpdb = cliargs.wildtype,
+                mutlist = None,
+                flags = cliargs.flags,
+                chaingrp = "".join(cliargs.chains),
+                spmdp = cliargs.energy_mdp,
+                ckpt = cliargs.ckpt,
+                dummy = True,
+                verbosity = verbose
+            )
+
+            def multienergy(d):
+                os.chdir(data.maindir)
+                os.chdir(d)
+                if os.path.isfile('multienergy1_finished.txt'):
+                    print(d, 'multienergy for complex was already finished')
+                    os.chdir(data.maindir)
+                else:
+                    data.do_minimization(d)
+                    data.single_point()
+                    data.lj()
+                    with open('multienergy1_finished.txt', 'w') as f:
+                        f.write("")
+                    os.chdir(data.maindir)
+
+            def GroPBS(d):
+                os.chdir(data.maindir)
+                os.chdir(d)
+                if os.path.isfile('solvation.log'):
+                    print(d, 'GroPBS was already finished')
+                    os.chdir(data.maindir)
+                else:
+                    print(d)
+                    data.electrostatics()
+                    os.chdir(data.maindir)
+
+            def multienergy_chains(d):
+                os.chdir(data.maindir)
+                os.chdir(d)
+                if os.path.isfile('multienergy2_finished.txt'):
+                    print(d, 'multienergy for chains was already finished')
+                    os.chdir(data.maindir)
+                else:
+                    data.do_minimization_chains()
+                    data.single_point_chains()
+                    data.lj_chains()
+                    with open('multienergy2_finished.txt', 'w') as f:
+                        f.write("")
+                    os.chdir(data.maindir)
+
+            def GroPBS_chains(d):
+                os.chdir(data.maindir)
+                os.chdir(d)
+                if os.path.isfile('multienergy3_finished.txt'):
+                    print(d, 'electrostatics for the chains was already finished')
+                    os.chdir(data.maindir)
+                else:
+                    print('chains_electro: ', d)
+                    data.electrostatics_chains()
+                    with open('multienergy3_finished.txt', 'w')as f:
+                        f.write("")
+                    os.chdir(data.maindir)
+
+            data.wds = [d+'/'+str(i) for d in data.wds \
+                    for i in range(1, len(data)+1)]
+
+            pool = Pool(cliargs.cores)
+            pool.map(multienergy, data.wds)
+            pool.close()
+            pool.join()
+
+
+            pool = Pool(cliargs.gropbs)
+            pool.map(GroPBS, data.wds)
+            pool.close()
+            pool.join()
+
+            os.chdir(data.maindir)
+            if not os.path.isfile('checkpoint2.txt'):
+                print("Splitting PDBs into chains, may take a few minutes")
+
+                for d in data.wds:
+                    os.chdir(data.maindir)
+                    os.chdir(d)
+                    data.split_chains(d)
+                    os.chdir(data.maindir)
+                with open('checkpoint2.txt', 'w') as f:
+                    f.write("Calculations for the complex are finished and are splitted into chains")
+            else:
+                pass
+
+            pool = Pool(cliargs.cores)
+            pool.map(multienergy_chains, data.wds)
+            pool.close()
+            pool.join()
+
+            pool = Pool(cliargs.gropbs)
+            pool.map(GroPBS_chains, data.wds)
+            pool.close()
+            pool.join()
+
+            data.area()
+
+            search = WTCollector(data)
+            search.search_data()
+
+            print("G values:")
+            print("bound")
+            print(search.G_bound_mean)
+            search.G_bound.to_csv('G_bound.csv')
+            search.G_bound_mean.to_csv("G_bound_mean.csv")
+            print("unbound")
+            print(search.G_grp1_mean)
+            search.G_grp1.to_csv('G_grp1.csv')
+            search.G_grp1_mean.to_csv('G_grp1_mean.csv')
+            print(search.G_grp2_mean)
+            search.G_grp2.to_csv('G_grp2.csv')
+            search.G_grp2_mean.to_csv('G_grp2_mean.csv')
+            search.merge()
+
